@@ -1,0 +1,14 @@
+* text=auto
+
+*.bat text eol=crlf
+*.cpp text eol=lf
+*.h text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+
+*.exe binary
+*.dll binary
+*.sys binary
+*.lib binary
+*.pcap binary
+*.pcapng binary
