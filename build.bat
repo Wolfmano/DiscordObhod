@@ -4,6 +4,7 @@ setlocal
 set "ROOT=%~dp0"
 set "BUILD_DIR=%ROOT%build"
 set "OUT=%BUILD_DIR%\DiscordMiniBypass.exe"
+set "RES=%BUILD_DIR%\app.res"
 
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 
@@ -31,14 +32,24 @@ if not exist "%ROOT%third_party\windivert\bin\WinDivert64.sys" (
   exit /b 1
 )
 
+windres "%ROOT%resources\app.rc" -O coff -o "%RES%"
+if errorlevel 1 (
+  echo Failed to compile application manifest resource.
+  exit /b 1
+)
+
 g++ -std=c++17 -O2 -Wall -Wextra ^
   "%ROOT%src\main.cpp" ^
+  "%RES%" ^
   -I "%ROOT%third_party\windivert\include" ^
   "%ROOT%third_party\windivert\lib\WinDivert.lib" ^
   -lws2_32 ^
   -o "%OUT%"
 
-if errorlevel 1 exit /b 1
+if errorlevel 1 (
+  echo Build failed. If DiscordMiniBypass.exe is running, stop it with Ctrl+C and try again.
+  exit /b 1
+)
 
 if exist "%BUILD_DIR%\WinDivert.dll" (
   fc /b "%ROOT%third_party\windivert\bin\WinDivert.dll" "%BUILD_DIR%\WinDivert.dll" >nul

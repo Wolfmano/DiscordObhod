@@ -1,17 +1,15 @@
 # DiscordObhod
 
-Небольшой Windows-проект на C++17 и WinDivert для экспериментов с обработкой Discord-трафика на уровне пакетов.
+Windows-инструмент на C++17 + WinDivert для локального обхода блокировок Discord на уровне сетевых пакетов.
 
-Сейчас реализована одна простая стратегия: программа перехватывает исходящий `TCP/443`, ищет TLS `ClientHello` и отправляет его двумя TCP-сегментами. Остальные перехваченные пакеты пропускаются без изменений.
+Программа запускает один встроенный авто-профиль:
 
-Это не полноценный аналог `zapret`, а компактный прототип, который удобно читать, менять и использовать как основу для дальнейших стратегий.
+- находит исходящие TLS `ClientHello` к доменам Discord;
+- отправляет fake ClientHello с плохой TCP checksum и маленьким TTL;
+- режет реальный `ClientHello` внутри SNI;
+- отправляет части в disorder-порядке.
 
-## Возможности
-
-- режим `bypass` с TCP split для TLS `ClientHello`;
-- режим `log` для пассивного наблюдения за TCP/UDP-трафиком;
-- настройка точки split через аргумент командной строки;
-- сборка через `build.bat`, VS Code task или CMake.
+Идея такая: обычный запуск `.exe` включает рабочий профиль, а `--debug` нужен только для диагностики.
 
 ## Зависимости
 
@@ -21,7 +19,7 @@
 https://github.com/basil00/WinDivert/releases
 ```
 
-Ожидаемая структура локальных файлов:
+Локальная структура:
 
 ```text
 third_party/windivert/include/windivert.h
@@ -30,70 +28,43 @@ third_party/windivert/bin/WinDivert.dll
 third_party/windivert/bin/WinDivert64.sys
 ```
 
-Бинарники WinDivert не хранятся в репозитории. Их нужно положить локально перед сборкой.
-
 ## Сборка
-
-Через VS Code можно запустить стандартную build task:
-
-```text
-Ctrl + Shift + B
-```
-
-Или собрать вручную:
 
 ```bat
 build.bat
 ```
 
-Также доступна сборка через CMake:
+После сборки в `build/` появится:
 
-```bat
-cmake -S . -B build
-cmake --build build --config Release
+```text
+DiscordMiniBypass.exe
+WinDivert.dll
+WinDivert64.sys
 ```
 
-После сборки исполняемый файл будет в `build/`. Скрипт также копирует рядом с ним `WinDivert.dll` и `WinDivert64.sys`.
+`DiscordMiniBypass.exe` содержит manifest `requireAdministrator`, поэтому при обычном запуске Windows должна показать UAC-запрос.
 
 ## Запуск
 
-Запускать нужно из консоли с правами администратора, иначе WinDivert не сможет открыть драйвер.
-
-Обычный режим обхода:
+Обычный запуск:
 
 ```bat
-.\build\DiscordMiniBypass.exe --mode bypass
+.\build\DiscordMiniBypass.exe
 ```
 
-То же самое с подробным выводом:
+Отладочный запуск:
 
 ```bat
-.\build\DiscordMiniBypass.exe --mode bypass --verbose
+.\build\DiscordMiniBypass.exe --debug
 ```
 
-Можно менять точку split:
-
-```bat
-.\build\DiscordMiniBypass.exe --mode bypass --split 2
-```
-
-На практике имеет смысл пробовать небольшие значения вроде `1`, `2`, `5`, `16`, `32`.
-
-Пассивный режим логирования:
-
-```bat
-.\build\DiscordMiniBypass.exe --mode log
-```
-
-В этом режиме пакеты не изменяются, а информация пишется в `packets.csv`.
+В debug-режиме программа пишет подробный вывод в консоль и добавляет строки в `packets.csv`.
 
 ## Ограничения
 
-Текущая стратегия работает только с исходящим `TCP/443`. Если проблема связана с UDP, DNS, IP-блокировкой или особенностями конкретного провайдера, одного TLS split может быть недостаточно.
+Этот подход работает против DPI, который анализирует TLS/SNI. Если Discord у провайдера блокируется по IP, DNS, маршруту или на стороне updater/CDN, одного локального packet desync может быть недостаточно. В таком случае нужен другой слой: DNS/DoH, прокси или туннель.
 
-Проект пока сделан как минимальная база: дальше сюда можно добавлять профили, фильтры по хостам/IP, UDP-стратегии и более удобную конфигурацию.
-
-## P.S
+## WinDivert
 
 - Upstream: https://github.com/basil00/WinDivert
 - License: LGPLv3/GPLv2 dual-license

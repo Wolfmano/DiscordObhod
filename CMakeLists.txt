@@ -23,6 +23,7 @@ endforeach()
 
 add_executable(DiscordMiniBypass
     src/main.cpp
+    resources/app.rc
 )
 
 target_include_directories(DiscordMiniBypass PRIVATE
