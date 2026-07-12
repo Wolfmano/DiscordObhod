@@ -2,6 +2,7 @@
 #include <chrono>
 #include <cctype>
 #include <climits>
+#include <cwchar>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -27,10 +28,12 @@ struct Config {
     SplitMode splitMode = SplitMode::Sni;
     UINT splitAt = 1;
     UINT fakeTtl = 3;
-    UINT fakeTtlMax = 6;
+    UINT fakeTtlMax = 10;
     bool verbose = false;
     bool help = false;
     bool debug = false;
+    bool launchDiscord = true;
+    bool dropHttpsResets = true;
     bool disorder = true;
     bool fake = true;
     std::string fakeHost = "www.microsoft.com";
@@ -50,6 +53,16 @@ struct ParsedPacket {
     PWINDIVERT_UDPHDR udpHeader = nullptr;
     PVOID payload = nullptr;
     UINT payloadLength = 0;
+};
+
+struct ProtectedFlow {
+    bool ipv6 = false;
+    UINT32 localAddr[4]{};
+    UINT32 remoteAddr[4]{};
+    UINT16 localPort = 0;
+    UINT16 remotePort = 0;
+    std::string sni;
+    std::chrono::steady_clock::time_point expiresAt{};
 };
 
 std::string getTimeString() {
@@ -96,6 +109,7 @@ void printUsage() {
         << "  DiscordMiniBypass.exe --debug\n\n"
         << "Options:\n"
         << "  --debug       Print detailed packet/desync logs\n"
+        << "  --no-launch   Do not auto-launch installed Discord.exe\n"
         << "  --help        Show this help\n";
 }
 
@@ -111,6 +125,11 @@ bool parseArgs(int argc, char* argv[], Config& config) {
         if (arg == "--debug" || arg == "--verbose" || arg == "-v") {
             config.debug = true;
             config.verbose = true;
+            continue;
+        }
+
+        if (arg == "--no-launch") {
+            config.launchDiscord = false;
             continue;
         }
 
@@ -295,6 +314,120 @@ bool isDiscordHost(const std::string& host) {
     return false;
 }
 
+void copyAddress(const ParsedPacket& parsed, bool local, bool outbound, UINT32 out[4]) {
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+
+    if (parsed.ipHeader != nullptr) {
+        if (outbound) {
+            out[0] = local ? parsed.ipHeader->SrcAddr : parsed.ipHeader->DstAddr;
+        } else {
+            out[0] = local ? parsed.ipHeader->DstAddr : parsed.ipHeader->SrcAddr;
+        }
+        return;
+    }
+
+    if (parsed.ipv6Header != nullptr) {
+        const UINT32* source = nullptr;
+        if (outbound) {
+            source = local ? parsed.ipv6Header->SrcAddr : parsed.ipv6Header->DstAddr;
+        } else {
+            source = local ? parsed.ipv6Header->DstAddr : parsed.ipv6Header->SrcAddr;
+        }
+
+        if (source != nullptr) {
+            std::memcpy(out, source, sizeof(UINT32) * 4);
+        }
+    }
+}
+
+bool sameAddress(const UINT32 left[4], const UINT32 right[4]) {
+    return std::memcmp(left, right, sizeof(UINT32) * 4) == 0;
+}
+
+void pruneProtectedFlows(std::vector<ProtectedFlow>& flows) {
+    const auto now = std::chrono::steady_clock::now();
+    flows.erase(
+        std::remove_if(
+            flows.begin(),
+            flows.end(),
+            [now](const ProtectedFlow& flow) {
+                return flow.expiresAt <= now;
+            }
+        ),
+        flows.end()
+    );
+}
+
+void rememberProtectedFlow(
+    std::vector<ProtectedFlow>& flows,
+    const ParsedPacket& parsed,
+    const std::string& sni
+) {
+    if (parsed.tcpHeader == nullptr || (parsed.ipHeader == nullptr && parsed.ipv6Header == nullptr)) {
+        return;
+    }
+
+    ProtectedFlow flow{};
+    flow.ipv6 = parsed.ipv6Header != nullptr;
+    copyAddress(parsed, true, true, flow.localAddr);
+    copyAddress(parsed, false, true, flow.remoteAddr);
+    flow.localPort = ntohs(parsed.tcpHeader->SrcPort);
+    flow.remotePort = ntohs(parsed.tcpHeader->DstPort);
+    flow.sni = sni;
+    flow.expiresAt = std::chrono::steady_clock::now() + std::chrono::minutes(3);
+
+    for (ProtectedFlow& existing : flows) {
+        if (existing.ipv6 == flow.ipv6 &&
+            existing.localPort == flow.localPort &&
+            existing.remotePort == flow.remotePort &&
+            sameAddress(existing.localAddr, flow.localAddr) &&
+            sameAddress(existing.remoteAddr, flow.remoteAddr)) {
+            existing.expiresAt = flow.expiresAt;
+            existing.sni = flow.sni;
+            return;
+        }
+    }
+
+    flows.push_back(flow);
+}
+
+bool isProtectedInboundReset(
+    const std::vector<ProtectedFlow>& flows,
+    const ParsedPacket& parsed,
+    std::string& sni
+) {
+    if (parsed.tcpHeader == nullptr ||
+        parsed.tcpHeader->Rst == 0 ||
+        (parsed.ipHeader == nullptr && parsed.ipv6Header == nullptr)) {
+        return false;
+    }
+
+    const bool ipv6 = parsed.ipv6Header != nullptr;
+    UINT32 localAddr[4]{};
+    UINT32 remoteAddr[4]{};
+    copyAddress(parsed, true, false, localAddr);
+    copyAddress(parsed, false, false, remoteAddr);
+
+    const UINT16 localPort = ntohs(parsed.tcpHeader->DstPort);
+    const UINT16 remotePort = ntohs(parsed.tcpHeader->SrcPort);
+
+    for (const ProtectedFlow& flow : flows) {
+        if (flow.ipv6 == ipv6 &&
+            flow.localPort == localPort &&
+            flow.remotePort == remotePort &&
+            sameAddress(flow.localAddr, localAddr) &&
+            sameAddress(flow.remoteAddr, remoteAddr)) {
+            sni = flow.sni;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 bool shouldSplitClientHello(const ParsedPacket& parsed, const Config& config, std::string& sni, UINT& splitAt) {
     if (!isTlsClientHello(parsed)) {
         return false;
@@ -445,13 +578,15 @@ bool overwriteTlsSniHost(char* packet, UINT packetLength, const std::string& hos
     return true;
 }
 
-bool sendFakeClientHello(
+bool sendFakeClientHelloVariant(
     HANDLE handle,
     char* packet,
     UINT packetLength,
     WINDIVERT_ADDRESS& address,
     const std::string& fakeHost,
-    UINT fakeTtl
+    UINT fakeTtl,
+    bool badChecksum,
+    INT32 seqDelta
 ) {
     std::vector<char> fake(packet, packet + packetLength);
 
@@ -464,6 +599,10 @@ bool sendFakeClientHello(
         return false;
     }
 
+    if (fakeParsed.tcpHeader == nullptr) {
+        return false;
+    }
+
     if (fakeParsed.ipHeader != nullptr) {
         fakeParsed.ipHeader->TTL = static_cast<UINT8>(fakeTtl);
     }
@@ -471,15 +610,22 @@ bool sendFakeClientHello(
         fakeParsed.ipv6Header->HopLimit = static_cast<UINT8>(fakeTtl);
     }
 
+    if (seqDelta != 0) {
+        const UINT32 originalSeq = ntohl(fakeParsed.tcpHeader->SeqNum);
+        fakeParsed.tcpHeader->SeqNum = htonl(static_cast<UINT32>(originalSeq + seqDelta));
+    }
+
     updateLengths(fake.data(), packetLength);
     WinDivertHelperCalcChecksums(fake.data(), packetLength, &address, 0);
 
-    ParsedPacket checksumParsed{};
-    if (!parsePacket(fake.data(), packetLength, checksumParsed) || checksumParsed.tcpHeader == nullptr) {
-        return false;
-    }
+    if (badChecksum) {
+        ParsedPacket checksumParsed{};
+        if (!parsePacket(fake.data(), packetLength, checksumParsed) || checksumParsed.tcpHeader == nullptr) {
+            return false;
+        }
 
-    checksumParsed.tcpHeader->Checksum ^= 0xFFFF;
+        checksumParsed.tcpHeader->Checksum ^= 0xFFFF;
+    }
 
     UINT sendLength = 0;
     return WinDivertSend(handle, fake.data(), packetLength, &sendLength, &address) != FALSE &&
@@ -496,14 +642,32 @@ bool sendFakeClientHelloRange(
     bool sentAny = false;
 
     for (UINT ttl = config.fakeTtl; ttl <= config.fakeTtlMax; ++ttl) {
-        if (sendFakeClientHello(handle, packet, packetLength, address, config.fakeHost, ttl)) {
+        if (sendFakeClientHelloVariant(handle, packet, packetLength, address, config.fakeHost, ttl, false, 0)) {
             sentAny = true;
             if (config.verbose) {
-                std::cout << "FAKE ttl=" << ttl << " host=" << config.fakeHost << " badsum=1\n";
+                std::cout << "FAKE_TTL ttl=" << ttl << " host=" << config.fakeHost << "\n";
             }
         } else if (config.verbose) {
-            std::cout << "FAKE_FAILED ttl=" << ttl << "\n";
+            std::cout << "FAKE_TTL_FAILED ttl=" << ttl << "\n";
         }
+    }
+
+    if (sendFakeClientHelloVariant(handle, packet, packetLength, address, config.fakeHost, 64, true, 0)) {
+        sentAny = true;
+        if (config.verbose) {
+            std::cout << "FAKE_BADSUM ttl=64 host=" << config.fakeHost << "\n";
+        }
+    } else if (config.verbose) {
+        std::cout << "FAKE_BADSUM_FAILED\n";
+    }
+
+    if (sendFakeClientHelloVariant(handle, packet, packetLength, address, config.fakeHost, 64, false, -10000)) {
+        sentAny = true;
+        if (config.verbose) {
+            std::cout << "FAKE_BADSEQ ttl=64 delta=-10000 host=" << config.fakeHost << "\n";
+        }
+    } else if (config.verbose) {
+        std::cout << "FAKE_BADSEQ_FAILED\n";
     }
 
     return sentAny;
@@ -640,6 +804,127 @@ bool splitTcpPayload(
     return true;
 }
 
+bool fileExists(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::wstring getEnvVar(const wchar_t* name) {
+    const DWORD size = GetEnvironmentVariableW(name, nullptr, 0);
+    if (size == 0) {
+        return L"";
+    }
+
+    std::wstring value(size, L'\0');
+    const DWORD written = GetEnvironmentVariableW(name, &value[0], size);
+    if (written == 0 || written >= size) {
+        return L"";
+    }
+
+    value.resize(written);
+    return value;
+}
+
+std::wstring findLatestDiscordExeIn(const std::wstring& root) {
+    const std::wstring searchPattern = root + L"\\app-*";
+    WIN32_FIND_DATAW findData{};
+    HANDLE findHandle = FindFirstFileW(searchPattern.c_str(), &findData);
+
+    if (findHandle == INVALID_HANDLE_VALUE) {
+        return L"";
+    }
+
+    std::wstring bestPath;
+    FILETIME bestWriteTime{};
+
+    do {
+        if ((findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            continue;
+        }
+
+        if (std::wcscmp(findData.cFileName, L".") == 0 ||
+            std::wcscmp(findData.cFileName, L"..") == 0) {
+            continue;
+        }
+
+        const std::wstring candidate = root + L"\\" + findData.cFileName + L"\\Discord.exe";
+        if (!fileExists(candidate)) {
+            continue;
+        }
+
+        if (bestPath.empty() || CompareFileTime(&findData.ftLastWriteTime, &bestWriteTime) > 0) {
+            bestPath = candidate;
+            bestWriteTime = findData.ftLastWriteTime;
+        }
+    } while (FindNextFileW(findHandle, &findData) != FALSE);
+
+    FindClose(findHandle);
+    return bestPath;
+}
+
+std::wstring findInstalledDiscordExe() {
+    const std::wstring localAppData = getEnvVar(L"LOCALAPPDATA");
+    if (localAppData.empty()) {
+        return L"";
+    }
+
+    const wchar_t* roots[] = {
+        L"Discord",
+        L"DiscordCanary",
+        L"DiscordPTB"
+    };
+
+    for (const wchar_t* root : roots) {
+        const std::wstring exe = findLatestDiscordExeIn(localAppData + L"\\" + root);
+        if (!exe.empty()) {
+            return exe;
+        }
+    }
+
+    return L"";
+}
+
+bool launchProcess(const std::wstring& exePath) {
+    if (exePath.empty()) {
+        return false;
+    }
+
+    const size_t separator = exePath.find_last_of(L"\\/");
+    const std::wstring workDir = separator == std::wstring::npos
+        ? L""
+        : exePath.substr(0, separator);
+    std::wstring commandLine = L"\"" + exePath + L"\"";
+
+    STARTUPINFOW startupInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    PROCESS_INFORMATION processInfo{};
+
+    std::vector<wchar_t> mutableCommandLine(commandLine.begin(), commandLine.end());
+    mutableCommandLine.push_back(L'\0');
+
+    const BOOL created = CreateProcessW(
+        exePath.c_str(),
+        mutableCommandLine.data(),
+        nullptr,
+        nullptr,
+        FALSE,
+        0,
+        nullptr,
+        workDir.empty() ? nullptr : workDir.c_str(),
+        &startupInfo,
+        &processInfo
+    );
+
+    if (!created) {
+        return false;
+    }
+
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    return true;
+}
+
 int runLogMode() {
     const char* filter =
         "(ip or ipv6) and "
@@ -691,7 +976,11 @@ int runLogMode() {
 
 int runBypassMode(const Config& config) {
     const char* filter =
-        "outbound and !impostor and (ip or ipv6) and tcp and tcp.DstPort == 443";
+        "(ip or ipv6) and tcp and !impostor and "
+        "("
+        "  (outbound and tcp.DstPort == 443) or "
+        "  (inbound and tcp.SrcPort == 443 and tcp.Rst)"
+        ")";
 
     HANDLE handle = WinDivertOpen(
         filter,
@@ -719,18 +1008,35 @@ int runBypassMode(const Config& config) {
 
     std::cout << "DiscordObhod started\n";
     std::cout << "Profile: auto Discord HTTPS desync\n";
-    std::cout << "Desync: fake badsum ClientHello ttl=" << config.fakeTtl
+    std::cout << "Desync: fake ClientHello ttl=" << config.fakeTtl
               << ".." << config.fakeTtlMax
-              << ", disorder split inside SNI\n";
+              << ", badsum, badseq, disorder split inside SNI\n";
+    std::cout << "RST guard: dropping inbound TCP resets from HTTPS servers\n";
     if (config.debug) {
         std::cout << "Debug: enabled, logs are written to packets.csv\n";
     }
     std::cout << "Press Ctrl+C to stop.\n\n";
 
+    if (config.launchDiscord) {
+        const std::wstring discordExe = findInstalledDiscordExe();
+        if (!discordExe.empty()) {
+            if (launchProcess(discordExe)) {
+                std::wcout << L"Started Discord directly: " << discordExe << L"\n";
+            } else {
+                std::wcout << L"Could not start Discord directly: " << discordExe << L"\n";
+                std::cout << "You can start Discord manually while this window is open.\n";
+            }
+        } else {
+            std::cout << "Discord installation was not found in LocalAppData. Start Discord manually while this window is open.\n";
+        }
+    }
+
     char packet[0xFFFF];
     std::string lastSni;
     UINT sameSniRetries = 0;
     bool warnedAboutRetries = false;
+    std::vector<ProtectedFlow> protectedFlows;
+    UINT droppedResets = 0;
 
     while (true) {
         WINDIVERT_ADDRESS address{};
@@ -746,6 +1052,41 @@ int runBypassMode(const Config& config) {
             continue;
         }
 
+        pruneProtectedFlows(protectedFlows);
+
+        if (!address.Outbound && parsed.tcpHeader != nullptr && parsed.tcpHeader->Rst != 0) {
+            std::string resetSni;
+            const bool protectedReset = isProtectedInboundReset(protectedFlows, parsed, resetSni);
+            const bool httpsReset = ntohs(parsed.tcpHeader->SrcPort) == 443;
+
+            if (protectedReset || (config.dropHttpsResets && httpsReset)) {
+                ++droppedResets;
+                if (config.verbose) {
+                    std::cout << "DROP_RST"
+                              << (protectedReset ? " protected=1" : " protected=0");
+                    if (!resetSni.empty()) {
+                        std::cout << " sni=" << resetSni;
+                    }
+                    std::cout << " count=" << droppedResets << "\n";
+                    logPacket(logFile, address, parsed, "DROP_RST");
+                } else if (droppedResets == 1) {
+                    std::cout << "Dropping injected TCP resets for Discord flows\n";
+                }
+                continue;
+            }
+
+            if (config.verbose && httpsReset) {
+                std::cout << "PASS_RST protected=0\n";
+            }
+
+            if (!sendPacket(handle, packet, packetLength, address)) {
+                std::cerr << "WinDivertSend failed for inbound RST. Error code: " << GetLastError() << "\n";
+            } else if (config.verbose) {
+                logPacket(logFile, address, parsed, "PASS_RST");
+            }
+            continue;
+        }
+
         std::string sni;
         UINT splitAt = config.splitAt;
         const bool shouldSplit = shouldSplitClientHello(parsed, config, sni, splitAt);
@@ -754,6 +1095,8 @@ int runBypassMode(const Config& config) {
         }
 
         if (shouldSplit && splitTcpPayload(handle, packet, packetLength, address, parsed, splitAt, config.disorder)) {
+            rememberProtectedFlow(protectedFlows, parsed, sni);
+
             if (config.verbose) {
                 if (!sni.empty()) {
                     std::cout << "SNI: " << sni << " splitAt=" << splitAt << "\n";

@@ -5,9 +5,11 @@ Windows-инструмент на C++17 + WinDivert для локального 
 Программа запускает один встроенный авто-профиль:
 
 - находит исходящие TLS `ClientHello` к доменам Discord;
-- отправляет fake ClientHello с плохой TCP checksum и маленьким TTL;
+- отправляет несколько fake ClientHello: low TTL, bad checksum и bad sequence;
 - режет реальный `ClientHello` внутри SNI;
 - отправляет части в disorder-порядке.
+- запоминает Discord TLS-соединения и отбрасывает входящие TCP `RST` по ним;
+- пробует запустить установленный `Discord.exe` напрямую из `%LocalAppData%\Discord\app-*`, чтобы не зависеть от окна `Checking for updates`.
 
 Идея такая: обычный запуск `.exe` включает рабочий профиль, а `--debug` нужен только для диагностики.
 
@@ -52,6 +54,8 @@ WinDivert64.sys
 .\build\DiscordMiniBypass.exe
 ```
 
+Программа поднимает обход и затем пытается сама открыть установленный Discord. Если Discord не найден, оставьте окно программы открытым и запустите Discord вручную.
+
 Отладочный запуск:
 
 ```bat
@@ -59,6 +63,12 @@ WinDivert64.sys
 ```
 
 В debug-режиме программа пишет подробный вывод в консоль и добавляет строки в `packets.csv`.
+
+Если нужно только поднять обход без автозапуска Discord:
+
+```bat
+.\build\DiscordMiniBypass.exe --no-launch
+```
 
 ## Ограничения
 
